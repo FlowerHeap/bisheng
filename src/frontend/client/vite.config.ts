@@ -3,10 +3,14 @@ import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 import { defineConfig } from 'vite';
 import { nodePolyfills } from 'vite-plugin-node-polyfills';
+import { viteStaticCopy } from 'vite-plugin-static-copy';
 import compression from 'vite-plugin-compression';
 import type { Plugin } from 'vite';
 
-const app_env = { BASE_URL: '/workspace' }
+const app_env = {
+  BASE_URL: '/workspace',
+  BISHENG_HOST: 'build/apps'
+}
 // https://vitejs.dev/config/
 export default defineConfig({
   server: {
@@ -19,8 +23,8 @@ export default defineConfig({
       //   // target: 'http://localhost:3080',
       //   changeOrigin: true,
       // },
-      '/workspace/bisheng': {
-        target: "http://192.168.106.116:9000",
+      '^(/workspace)?/bisheng': {
+        target: "http://192.168.106.120:3002",
         changeOrigin: true,
         secure: false,
         rewrite: (path) => {
@@ -31,23 +35,24 @@ export default defineConfig({
         target: 'http://192.168.106.120:3002',
         changeOrigin: true,
         secure: false,
-        rewrite: (path) => {
-          return path.replace(/^\/workspace\/api/, '/api');
-        },
+        ws: true,
         configure: (proxy, options) => {
           proxy.on('proxyReq', (proxyReq, req, res) => {
             console.log('Proxying request to:', proxyReq.path);
           });
-        }
+        },
+        rewrite: (path) => {
+          return path.replace(/^\/workspace/, '');
+        },
       },
       '/workspace/tmp-dir': {
-        target: 'http://192.168.106.116:9000',
+        target: 'http://192.168.106.120:3002',
         changeOrigin: true,
         secure: false,
         rewrite: (path) => {
-          return path.replace(/^\/workspace\/tmp-dir/, '/tmp-dir');
+          return path.replace(/^\/workspace/, '');
         },
-      }
+      },
     },
   },
   base: app_env.BASE_URL || '/',
@@ -70,8 +75,8 @@ export default defineConfig({
       workbox: {
         globPatterns: ['**/*'],
         globIgnores: ['images/**/*'],
-        maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
-        navigateFallbackDenylist: [/^\/oauth/],
+        maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+        navigateFallbackDenylist: [/^\/oauth/]
       },
       includeAssets: ['**/*'],
       manifest: {
@@ -118,6 +123,14 @@ export default defineConfig({
       threshold: 10240, // compress files larger than 10KB
       algorithm: 'gzip',
       ext: '.gz',
+    }),
+    viteStaticCopy({
+      targets: [
+        {
+          src: 'node_modules/pdfjs-dist/build/pdf.worker.min.js',
+          dest: './'
+        }
+      ]
     }),
   ],
   publicDir: './public',
@@ -192,7 +205,7 @@ export default defineConfig({
       '~': path.join(__dirname, 'src/'),
       $fonts: resolve('public/fonts'),
     },
-  },
+  }
 });
 
 interface SourcemapExclude {

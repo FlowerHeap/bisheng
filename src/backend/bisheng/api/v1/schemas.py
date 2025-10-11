@@ -14,6 +14,7 @@ from bisheng.database.models.knowledge import KnowledgeRead
 from bisheng.database.models.llm_server import LLMModelBase, LLMServerBase
 from bisheng.database.models.message import ChatMessageRead
 from bisheng.database.models.tag import Tag
+from bisheng_langchain.linsight.const import TaskMode
 
 
 class CaptchaInput(BaseModel):
@@ -82,6 +83,20 @@ def resp_200(data: Union[list, dict, str, Any] = None,
 
 
 def resp_500(code: int = 500,
+             data: Union[list, dict, str, Any] = None,
+             message: str = 'BAD REQUEST') -> UnifiedResponseModel:
+    """错误的逻辑回复"""
+    return UnifiedResponseModel(status_code=code, status_message=message, data=data)
+
+
+def resp_501(code: int = 501,
+             data: Union[list, dict, str, Any] = None,
+             message: str = 'BAD REQUEST') -> UnifiedResponseModel:
+    """错误的逻辑回复"""
+    return UnifiedResponseModel(status_code=code, status_message=message, data=data)
+
+
+def resp_502(code: int = 502,
              data: Union[list, dict, str, Any] = None,
              message: str = 'BAD REQUEST') -> UnifiedResponseModel:
     """错误的逻辑回复"""
@@ -160,7 +175,7 @@ class ChatMessage(BaseModel):
 class ChatResponse(ChatMessage):
     """Chat response schema."""
 
-    intermediate_steps: str = ''
+    intermediate_steps: Optional[str] = ''
     is_bot: bool | int = True
     category: str = 'processing'
 
@@ -451,6 +466,26 @@ class WSPrompt(BaseModel):
     bingUrl: Optional[str] = None
 
 
+class LinsightConfig(BaseModel):
+    """
+    灵思管理配置
+    """
+    input_placeholder: str = Field(..., description='输入框提示语')
+    tools: Optional[List[Dict]] = Field(None, description='灵思可选工具列表')
+
+
+class WorkbenchModelConfig(BaseModel):
+    """
+    灵思模型配置
+    """
+    # 任务执行模型
+    task_model: Optional[WSModel] = Field(None, description='任务执行模型')
+    # 检索embedding模型
+    embedding_model: Optional[WSModel] = Field(None, description='embedding模型')
+    # 灵思执行模式
+    linsight_executor_mode: Optional[TaskMode] = Field(None, description='灵思执行模式')
+
+
 class WorkstationConfig(BaseModel):
     menuShow: bool = Field(default=True, description='是否显示左侧菜单栏')
     maxTokens: Optional[int] = Field(default=1500, description='最大token数')
@@ -466,6 +501,13 @@ class WorkstationConfig(BaseModel):
     knowledgeBase: Optional[WSPrompt] = None
     fileUpload: Optional[WSPrompt] = None
     systemPrompt: Optional[str] = None
+    applicationCenterWelcomeMessage: Optional[str] = Field(default='', max_length=1000,
+                                                           pattern=r'^[\u4e00-\u9fff\w\s\.,;:!@#$%^&*()\-_=+\[\]{}|\\\'"<>/?`~·！￥（）【】、《》，。；：“”‘’？]+$',
+                                                           description='应用中心欢迎消息')
+    applicationCenterDescription: Optional[str] = Field(default='', max_length=1000,
+                                                        pattern=r'^[\u4e00-\u9fff\w\s\.,;:!@#$%^&*()\-_=+\[\]{}|\\\'"<>/?`~·！￥（）【】、《》，。；：“”‘’？]+$',
+                                                        description='应用中心描述')
+    linsightConfig: Optional[LinsightConfig] = Field(default=None, description='灵思配置')
 
 
 class ExcelRule(BaseModel):
@@ -493,9 +535,9 @@ class FileProcessBase(BaseModel):
     @model_validator(mode='before')
     @classmethod
     def check_separator_rule(cls, values: Any):
-        if values.get('separator', None) is None:
+        if not values.get('separator', None):
             values['separator'] = ['\n\n', '\n']
-        if values.get('separator_rule', None) is None:
+        if not values.get('separator_rule', None):
             values['separator_rule'] = ['after' for _ in values['separator']]
         if values.get('chunk_size', None) is None:
             values['chunk_size'] = 1000
@@ -509,8 +551,10 @@ class FileProcessBase(BaseModel):
             values['enable_formula'] = 1
         if values.get("retain_images") is None:
             values['retain_images'] = 1
-        if values.get("excel_rules") is None:
-            values['excel_rules'] = ExcelRule()
+        if values.get("excel_rule") is None:
+            values['excel_rule'] = ExcelRule()
+        if values.get("knowledge_id") is None:
+            raise ValueError('knowledge_id is required')
 
         return values
 
@@ -557,3 +601,25 @@ class KnowledgeFileProcess(FileProcessBase):
     file_list: List[KnowledgeFileOne] = Field(..., description='文件列表')
     callback_url: Optional[str] = Field(default=None, description='异步任务回调地址')
     extra: Optional[str] = Field(default=None, description='附加信息')
+
+
+# 知识库重新分段调整
+class KnowledgeFileReProcess(FileProcessBase):
+    kb_file_id: int = Field(..., description='知识库文件ID')
+    excel_rule: Optional[ExcelRule] = Field(default=None, description="Excel rules")
+    callback_url: Optional[str] = Field(default=None, description='异步任务回调地址')
+    extra: Optional[str] = Field(default=None, description='附加信息')
+
+
+class FrequentlyUsedChat(BaseModel):
+    user_link_type: str = Field(..., description='用户相关联的type')
+    type_detail: str = Field(..., description='用户相关联的type_id')
+
+
+class UpdateKnowledgeReq(BaseModel):
+    """更新知识库模型请求"""
+    model_id: int = Field(..., description='embedding模型ID')
+    model_type: Optional[str] = Field(default=None, description='模型类型，不传时会根据model_id自动查询')
+    knowledge_id: Optional[int] = Field(default=None, description='知识库ID，如果为空则更新所有私有知识库')
+    knowledge_name: Optional[str] = Field(default=None, description='知识库名称')
+    description: Optional[str] = Field(default=None, description='知识库描述')

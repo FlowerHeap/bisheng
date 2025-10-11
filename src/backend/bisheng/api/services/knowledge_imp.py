@@ -2,11 +2,9 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, BinaryIO
+from typing import Any, Dict, List, Optional, BinaryIO, Union
 
 import requests
-from bisheng_langchain.rag.extract_info import extract_title
-from bisheng_langchain.text_splitter import ElemCharacterTextSplitter
 from langchain.embeddings.base import Embeddings
 from langchain.schema.document import Document
 from langchain.text_splitter import CharacterTextSplitter
@@ -59,6 +57,8 @@ from bisheng.interface.initialize.loading import instantiate_vectorstore
 from bisheng.settings import settings
 from bisheng.utils.embedding import decide_embeddings
 from bisheng.utils.minio_client import minio_client
+from bisheng_langchain.rag.extract_info import extract_title
+from bisheng_langchain.text_splitter import ElemCharacterTextSplitter
 
 filetype_load_map = {
     "txt": TextLoader,
@@ -80,8 +80,9 @@ class KnowledgeUtils:
     chunk_split = "\n----------\n"
 
     @classmethod
-    def get_preview_cache_key(cls, knowledge_id: int, file_path: str) -> str:
-        md5_value = md5_hash(file_path)
+    def get_preview_cache_key(cls, knowledge_id: int, file_path: str, md5_value=None) -> str:
+        if not md5_value:
+            md5_value = md5_hash(file_path)
         return f"preview_file_chunk:{knowledge_id}:{md5_value}"
 
     @classmethod
@@ -262,18 +263,29 @@ def delete_vector_files(file_ids: List[int], knowledge: Knowledge) -> bool:
     logger.info(f"delete_files file_ids={file_ids} knowledge_id={knowledge.id}")
     embeddings = FakeEmbedding()
     vector_client = decide_vectorstores(knowledge.collection_name, "Milvus", embeddings)
-    vector_client.col.delete(expr=f"file_id in {file_ids}", timeout=10)
+    # 如果collection不存在则不处理
+    if vector_client.col:
+        vector_client.col.delete(expr=f"file_id in {file_ids}", timeout=10)
     vector_client.close_connection(vector_client.alias)
     logger.info(f"delete_milvus file_ids={file_ids}")
 
     es_client = decide_vectorstores(
         knowledge.index_name, "ElasticKeywordsSearch", embeddings
     )
-    for one in file_ids:
+    # for one in file_ids:
+    #     res = es_client.client.delete_by_query(
+    #         index=knowledge.index_name, query={"match": {"metadata.file_id": one}}
+    #     )
+    #
+    #     logger.info(f"act=delete_es file_id={one} res={res}")
+
+    if es_client.client.indices.exists(index=es_client.index_name):
         res = es_client.client.delete_by_query(
-            index=knowledge.index_name, query={"match": {"metadata.file_id": one}}
+            index=es_client.index_name,
+            query={"terms": {"metadata.file_id": file_ids}},
         )
-        logger.info(f"act=delete_es file_id={one} res={res}")
+        logger.info(f"act=delete_es file_ids={file_ids} res={res}")
+
     return True
 
 
@@ -318,9 +330,9 @@ def delete_knowledge_file_vectors(file_ids: List[int], clear_minio: bool = True)
 
 
 def decide_vectorstores(
-        collection_name: str, vector_store: str, embedding: Embeddings
-) -> VectorStore:
-    """vector db"""
+        collection_name: str, vector_store: str, embedding: Embeddings, knowledge_id: int = None
+) -> Union[VectorStore, Any]:
+    """ vector db if used by query, must have knowledge_id"""
     param: dict = {"embedding": embedding}
 
     if vector_store == "ElasticKeywordsSearch":
@@ -333,6 +345,8 @@ def decide_vectorstores(
             vector_config["ssl_verify"] = eval(vector_config["ssl_verify"])
 
     elif vector_store == "Milvus":
+        if knowledge_id and collection_name.startswith("partition"):
+            param["partition_key"] = knowledge_id
         vector_config = settings.get_vectors_conf().milvus.model_dump()
         if not vector_config:
             # 无相关配置
@@ -606,7 +620,7 @@ def parse_partitions(partitions: List[Any]) -> Dict:
             if index == len(bboxes) - 1:
                 val = text[indexes[index][0]:]
             else:
-                val = text[indexes[index][0]:indexes[index][1] + 1]
+                val = text[indexes[index][0]:indexes[index][1]]
             res[key] = {"text": val, "type": part["type"], "part_id": part_index}
     return res
 
@@ -646,8 +660,8 @@ def parse_document_title(title: str) -> str:
 def read_chunk_text(
         input_file,
         file_name,
-        separator: List[str],
-        separator_rule: List[str],
+        separator: Optional[List[str]],
+        separator_rule: Optional[List[str]],
         chunk_size: int,
         chunk_overlap: int,
         knowledge_id: Optional[int] = None,
@@ -656,6 +670,8 @@ def read_chunk_text(
         force_ocr: int = 1,
         filter_page_header_footer: int = 0,
         excel_rule: ExcelRule = None,
+        no_summary: bool = False,
+
 ) -> (List[str], List[dict], str, Any):  # type: ignore
     """
     0：chunks text
@@ -664,14 +680,17 @@ def read_chunk_text(
     3: ocr bbox data: maybe None
     """
     # 获取文档总结标题的llm
-    try:
-        llm = decide_knowledge_llm()
-        knowledge_llm = LLMService.get_knowledge_llm()
-    except Exception as e:
-        logger.exception("knowledge_llm_error:")
-        raise Exception(
-            f"文档知识库总结模型已失效，请前往模型管理-系统模型设置中进行配置。{str(e)}"
-        )
+    llm = None
+    if not no_summary:
+        try:
+            llm = decide_knowledge_llm()
+            knowledge_llm = LLMService.get_knowledge_llm()
+        except Exception as e:
+            logger.exception("knowledge_llm_error:")
+            raise Exception(
+                f"文档知识库总结模型已失效，请前往模型管理-系统模型设置中进行配置。{str(e)}"
+            )
+
     text_splitter = ElemCharacterTextSplitter(
         separators=separator,
         separator_rule=separator_rule,
@@ -747,11 +766,11 @@ def read_chunk_text(
             )
 
         # 沿用原来的方法处理md文件
-        loader = filetype_load_map["md"](file_path=md_file_name)
+        loader = filetype_load_map["md"](file_path=md_file_name, autodetect_encoding=True)
         documents = loader.load()
 
     elif file_extension_name in ["txt", "md"]:
-        loader = filetype_load_map[file_extension_name](file_path=input_file)
+        loader = filetype_load_map[file_extension_name](file_path=input_file, autodetect_encoding=True)
         documents = loader.load()
     else:
         if etl_for_lm_url:
@@ -1027,17 +1046,14 @@ def add_qa(db_knowledge: Knowledge, data: QAKnowledgeUpsert) -> QAKnowledge:
         raise e
 
 
-def qa_status_change(qa_id: int, target_status: int):
+def qa_status_change(qa_db: QAKnowledge, target_status: int, db_knowledge: Knowledge):
     """QA 状态切换"""
-    qa_db = QAKnoweldgeDao.get_qa_knowledge_by_primary_id(qa_id)
 
     if qa_db.status == target_status:
         logger.info("qa status is same, skip")
         return
-
-    db_knowledge = KnowledgeDao.query_by_id(qa_db.knowledge_id)
     if target_status == QAStatus.DISABLED.value:
-        delete_vector_data(db_knowledge, [qa_id])
+        delete_vector_data(db_knowledge, [qa_db.id])
         qa_db.status = target_status
         QAKnoweldgeDao.update(qa_db)
     else:

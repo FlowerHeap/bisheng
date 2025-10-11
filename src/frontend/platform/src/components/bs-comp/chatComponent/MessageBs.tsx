@@ -1,20 +1,15 @@
-import { AvatarIcon } from "@/components/bs-icons/avatar";
+import { ToastIcon } from "@/components/bs-icons";
 import { LoadIcon, LoadingIcon } from "@/components/bs-icons/loading";
-import { CodeBlock } from "@/modals/formModal/chatMessage/codeBlock";
+import { cname } from "@/components/bs-ui/utils";
+import MessageMarkDown from "@/pages/BuildPage/flow/FlowChat/MessageMarkDown";
 import { ChatMessageType } from "@/types/chat";
 import { formatStrTime } from "@/util/utils";
 import { copyText } from "@/utils";
-import { useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import rehypeMathjax from "rehype-mathjax";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
+import { ChevronDown } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
 import MessageButtons from "./MessageButtons";
 import SourceEntry from "./SourceEntry";
 import { useMessageStore } from "./messageStore";
-import { ChevronDown } from "lucide-react";
-import { cname } from "@/components/bs-ui/utils";
-import { ToastIcon } from "@/components/bs-icons";
 
 // 颜色列表
 const colorList = [
@@ -59,55 +54,15 @@ export const ReasoningLog = ({ loading, msg = '' }) => {
     </div>
 }
 
-export default function MessageBs({ debug, mark = false, logo, data, onUnlike = () => { }, onSource, onMarkClick }: { logo: string, data: ChatMessageType, onUnlike?: any, onSource?: any }) {
+export default function MessageBs({ debug, mark = false, logo, data, onUnlike = () => { }, onSource, onMarkClick, chat }: { logo: string, data: ChatMessageType, onUnlike?: any, onSource?: any }) {
     const avatarColor = colorList[
         (data.sender?.split('').reduce((num, s) => num + s.charCodeAt(), 0) || 0) % colorList.length
     ]
 
     const message = useMemo(() => {
-        const msg = data.message[data.chatKey] || data.message
-        return msg.replaceAll('$$', '$')
+        return data.message[data.chatKey] || data.message
     }, [data.message])
 
-    const mkdown = useMemo(
-        () => (
-            <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkMath]}
-                rehypePlugins={[rehypeMathjax]}
-                linkTarget="_blank"
-                className="bs-mkdown inline-block break-all max-w-full text-sm text-text-answer "
-                components={{
-                    code: ({ node, inline, className, children, ...props }) => {
-                        if (children.length) {
-                            if (children[0] === "▍") {
-                                return (<span className="form-modal-markdown-span"> ▍ </span>);
-                            }
-
-                            if (typeof children[0] === "string") {
-                                children[0] = children[0].replace("▍", "▍");
-                            }
-                        }
-
-                        const match = /language-(\w+)/.exec(className || "");
-
-                        return !inline ? (
-                            <CodeBlock
-                                key={Math.random()}
-                                language={(match && match[1]) || ""}
-                                value={String(children).replace(/\n$/, "")}
-                                {...props}
-                            />
-                        ) : (
-                            <code className={className} {...props}> {children} </code>
-                        );
-                    },
-                }}
-            >
-                {message}
-            </ReactMarkdown>
-        ),
-        [data.message]
-    )
 
     const messageRef = useRef<HTMLDivElement>(null)
     const handleCopyMessage = () => {
@@ -129,15 +84,10 @@ export default function MessageBs({ debug, mark = false, logo, data, onUnlike = 
                 </div>
                 <div className="min-h-8 px-6 py-4 rounded-2xl bg-[#F5F6F8] dark:bg-[#313336]">
                     <div className="flex gap-2">
-                        {logo ? <div className="max-w-6 min-w-6 max-h-6 rounded-full overflow-hidden">
-                            <img className="w-6 h-6" src={logo} />
-                        </div>
-                            : <div className="w-6 h-6 min-w-6 flex justify-center items-center rounded-full" style={{ background: avatarColor }} >
-                                <AvatarIcon />
-                            </div>}
+                        {logo}
                         {data.message.toString() ?
                             <div ref={messageRef} className="text-sm max-w-[calc(100%-24px)]">
-                                {mkdown}
+                                {<MessageMarkDown message={message} />}
                                 {/* @user */}
                                 {data.receiver && <p className="text-blue-500 text-sm">@ {data.receiver.user_name}</p>}
                                 {/* 光标 */}

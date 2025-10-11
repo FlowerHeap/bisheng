@@ -78,6 +78,8 @@ class MinioConf(BaseModel):
     cert_check: Optional[bool] = Field(default=False, description="是否校验证书")
     endpoint: Optional[str] = Field(default="127.0.0.1:9000", description="minio 地址")
     sharepoint: Optional[str] = Field(default="127.0.0.1:9000", description="minio 公开访问地址")
+    share_schema: Optional[bool] = Field(default=False, description="minio 公开访问地址是否使用https")
+    share_cert_check: Optional[bool] = Field(default=False, description="minio 公开访问地址是否校验证书")
     access_key: Optional[str] = Field(default="minioadmin", description="minio 用户名")
     secret_key: Optional[str] = Field(default="minioadmin", description="minio 密码")
     public_bucket: Optional[str] = Field(default="bisheng",
@@ -96,7 +98,7 @@ class WorkflowConf(BaseModel):
 
 
 class CeleryConf(BaseModel):
-    task_routers: Optional[dict] = Field(default_factory=dict, description='任务路由配置')
+    task_routers: Optional[dict] = Field(default_factory=dict, validate_default=True, description='任务路由配置')
 
     @field_validator('task_routers', mode='before')
     def handle_routers(cls, value):
@@ -106,6 +108,20 @@ class CeleryConf(BaseModel):
                 "bisheng.worker.workflow.*": {"queue": "workflow_celery"},  # 工作流执行相关任务
             }
         return value
+
+
+class LinsightConf(BaseModel):
+    debug: bool = Field(default=False, description='是否开启debug模式')
+    tool_buffer: int = Field(default=100000, description='工具执行历史记录的最大token，超过后需要总结下历史记录')
+    max_steps: int = Field(default=200, description='单个任务最大执行步骤数，防止死循环')
+    retry_num: int = Field(default=3, description='灵思任务执行过程中模型调用重试次数')
+    retry_sleep: int = Field(default=5, description='灵思任务执行过程中模型调用重试间隔时间（秒）')
+    max_file_num: int = Field(default=5, description='生成SOP时，prompt里放的用户上传文件信息的数量')
+    max_knowledge_num: int = Field(default=20, description='生成SOP时，prompt里放的知识库信息的数量')
+    waiting_list_url: str = Field(default=None, description='waiting list 跳转链接')
+    default_temperature: float = Field(default=0, description='模型请求时的默认温度')
+    retry_temperature: float = Field(default=1, description='react模式json解析失败后重试时模型温度')
+    file_content_length: int = Field(default=5000, description='拆分子任务时读取文件内容的字符数，超过后会截断')
 
 
 class Settings(BaseModel):
@@ -144,6 +160,7 @@ class Settings(BaseModel):
     gpts: dict = {}
     openai_conf: dict = {}
     minio_conf: dict = {}
+    linsight_conf: LinsightConf = LinsightConf()
     logger_conf: LoggerConf = LoggerConf()
     password_conf: PasswordConf = PasswordConf()
     system_login_method: SystemLoginMethod = {}
@@ -257,6 +274,15 @@ class Settings(BaseModel):
         all_config = self.get_all_config()
         return WorkflowConf(**all_config.get('workflow', {}))
 
+    def get_linsight_conf(self) -> LinsightConf:
+        # 获取灵思相关的配置项
+        all_config = self.get_all_config()
+        conf = LinsightConf(debug=self.linsight_conf.debug)
+        linsight_conf = all_config.get('linsight', {})
+        for k, v in linsight_conf.items():
+            setattr(conf, k, v)
+        return conf
+
     def get_from_db(self, key: str):
         # 先获取所有的key
         all_config = self.get_all_config()
@@ -277,6 +303,24 @@ class Settings(BaseModel):
                     select(Config).where(Config.key == 'initdb_config')).first()
                 if initdb_config:
                     redis_client.set(redis_key, initdb_config.value, 100)
+                    return yaml.safe_load(initdb_config.value)
+                else:
+                    raise Exception('initdb_config not found, please check your system config')
+
+    async def aget_all_config(self):
+        from bisheng.database.base import async_session_getter
+        from bisheng.cache.redis import redis_client
+        from bisheng.database.models.config import Config
+
+        redis_key = 'config:initdb_config'
+        cache = await redis_client.aget(redis_key)
+        if cache:
+            return yaml.safe_load(cache)
+        else:
+            async with async_session_getter() as session:
+                initdb_config = (await session.exec(select(Config).where(Config.key == 'initdb_config'))).first()
+                if initdb_config:
+                    await redis_client.aset(redis_key, initdb_config.value, 100)
                     return yaml.safe_load(initdb_config.value)
                 else:
                     raise Exception('initdb_config not found, please check your system config')

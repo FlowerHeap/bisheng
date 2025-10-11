@@ -3,22 +3,28 @@ import json
 from datetime import datetime
 from typing import Optional, Any
 
-from pydantic import field_validator
-
-from bisheng.api.services import knowledge_imp, llm
-from bisheng.api.services.base import BaseService
-from bisheng.api.services.knowledge import KnowledgeService
-from bisheng.api.services.user_service import UserPayload
-from bisheng.api.v1.schemas import KnowledgeFileOne, KnowledgeFileProcess, WorkstationConfig
-from bisheng.database.constants import MessageCategory
-from bisheng.database.models.config import Config, ConfigDao, ConfigKeyEnum
-from bisheng.database.models.knowledge import KnowledgeCreate, KnowledgeDao, KnowledgeTypeEnum
-from bisheng.database.models.message import ChatMessage, ChatMessageDao
-from bisheng.database.models.session import MessageSession
 from fastapi import BackgroundTasks, Request
 from langchain_core.messages import AIMessage, HumanMessage
 from loguru import logger
 from openai import BaseModel
+from pydantic import field_validator
+
+from bisheng.api.errcode.base import ServerError
+from bisheng.api.services import llm
+from bisheng.api.services.base import BaseService
+from bisheng.api.services.knowledge import KnowledgeService
+from bisheng.api.services.knowledge import mixed_retrieval_recall
+from bisheng.api.services.user_service import UserPayload
+from bisheng.api.v1.schemas import KnowledgeFileOne, KnowledgeFileProcess, WorkstationConfig
+from bisheng.database.constants import MessageCategory
+from bisheng.database.models.config import Config, ConfigDao, ConfigKeyEnum
+from bisheng.database.models.gpts_tools import GptsToolsDao
+from bisheng.database.models.knowledge import KnowledgeCreate, KnowledgeDao, KnowledgeTypeEnum
+from bisheng.database.models.message import ChatMessage, ChatMessageDao
+from bisheng.database.models.session import MessageSession
+from bisheng.utils.embedding import create_knowledge_keyword_store, decide_embeddings
+from bisheng.utils.embedding import create_knowledge_vector_store
+from bisheng.utils.exceptions import MessageException
 
 
 class WorkStationService(BaseService):
@@ -29,16 +35,44 @@ class WorkStationService(BaseService):
         """ 更新workflow的默认模型配置 """
         config = ConfigDao.get_config(ConfigKeyEnum.WORKSTATION)
         if config:
-            config.value = json.dumps(data.dict())
+            config.value = data.model_dump_json()
         else:
             config = Config(key=ConfigKeyEnum.WORKSTATION.value, value=json.dumps(data.dict()))
         ConfigDao.insert_config(config)
+
         return data
 
     @classmethod
-    def get_config(cls) -> WorkstationConfig | None:
-        """ 获取工作台的默认配置 """
-        config = ConfigDao.get_config(ConfigKeyEnum.WORKSTATION)
+    def sync_tool_info(cls, tools: list[dict]) -> list[dict]:
+        """ 同步工具信息 """
+        if not tools:
+            return []
+        tool_type_ids = [t.get("id") for t in tools]
+        tool_type_info = GptsToolsDao.get_all_tool_type(tool_type_ids)
+        exists_tool_type = {t.id: t for t in tool_type_info}
+        tool_info = GptsToolsDao.get_list_by_type(list(exists_tool_type.keys()))
+        exists_tool_info = {t.id: t for t in tool_info}
+        new_tools = []
+        for one in tools:
+            new_one = exists_tool_type.get(one.get("id"))
+            if not new_one:
+                continue
+            one["name"] = new_one.name
+            one["description"] = new_one.description
+            new_children = []
+            for item in one.get("children", []):
+                if not exists_tool_info.get(item.get("id")):
+                    continue
+                item["name"] = exists_tool_info[item.get("id")].name
+                item["description"] = exists_tool_info[item.get("id")].desc
+                item["tool_key"] = exists_tool_info[item.get("id")].tool_key
+                new_children.append(item)
+            one["children"] = new_children
+            new_tools.append(one)
+        return new_tools
+
+    @classmethod
+    def parse_config(cls, config: Any) -> Optional[WorkstationConfig]:
         if config:
             ret = json.loads(config.value)
             ret = WorkstationConfig(**ret)
@@ -51,16 +85,31 @@ class WorkStationService(BaseService):
             if ret.webSearch and not ret.webSearch.params:
                 ret.webSearch.tool = 'bing'
                 ret.webSearch.params = {'api_key': ret.webSearch.bingKey, 'base_url': ret.webSearch.bingUrl}
+            if ret.linsightConfig:
+                # 判断工具是否被删除, 同步工具最新的信息名称和描述等
+                ret.linsightConfig.tools = cls.sync_tool_info(ret.linsightConfig.tools)
             return ret
         return None
 
     @classmethod
+    def get_config(cls) -> WorkstationConfig | None:
+        """ 获取工作台的默认配置 """
+        config = ConfigDao.get_config(ConfigKeyEnum.WORKSTATION)
+        return cls.parse_config(config)
+
+    @classmethod
+    async def aget_config(cls) -> WorkstationConfig | None:
+        """ 异步获取工作台的默认配置 """
+        config = await ConfigDao.aget_config(ConfigKeyEnum.WORKSTATION)
+        return cls.parse_config(config)
+
+    @classmethod
     async def uploadPersonalKnowledge(
-        cls,
-        request: Request,
-        login_user: UserPayload,
-        file_path,
-        background_tasks: BackgroundTasks,
+            cls,
+            request: Request,
+            login_user: UserPayload,
+            file_path,
+            background_tasks: BackgroundTasks,
     ):
         # 查询是否有个人知识库
         knowledge = KnowledgeDao.get_user_knowledge(login_user.user_id, None,
@@ -77,6 +126,10 @@ class WorkStationService(BaseService):
             knowledge = knowledge[0]
         req_data = KnowledgeFileProcess(knowledge_id=knowledge.id,
                                         file_list=[KnowledgeFileOne(file_path=file_path)])
+        try:
+            _ = decide_embeddings(knowledge.model)
+        except Exception as e:
+            raise ServerError.http_exception(msg="请联系管理员检查工作台向量检索模型状态")
         res = KnowledgeService.process_knowledge_file(request,
                                                       UserPayload(user_id=login_user.user_id),
                                                       background_tasks, req_data)
@@ -84,11 +137,11 @@ class WorkStationService(BaseService):
 
     @classmethod
     def queryKnowledgeList(
-        cls,
-        request: Request,
-        login_user: UserPayload,
-        page: int,
-        size: int,
+            cls,
+            request: Request,
+            login_user: UserPayload,
+            page: int,
+            size: int,
     ):
         # 查询是否有个人知识库
         knowledge = KnowledgeDao.get_user_knowledge(login_user.user_id, None,
@@ -105,27 +158,60 @@ class WorkStationService(BaseService):
 
     @classmethod
     def queryChunksFromDB(cls, question: str, login_user: UserPayload):
+        """
+        从数据库中查询相关知识块
+        
+        Args:
+            question: 用户查询问题
+            login_user: 登录用户信息
+            
+        Returns:
+            List[str]: 格式化后的知识库内容列表，格式为：
+                "[file name]:文件名\n[file content begin]\n内容\n[file content end]\n"
+        """
         knowledge = KnowledgeDao.get_user_knowledge(login_user.user_id, None,
                                                     KnowledgeTypeEnum.PRIVATE)
 
         if not knowledge:
             return []
 
-        search_kwargs = {'partition_key': knowledge[0].id}
-        embedding = knowledge_imp.decide_embeddings(knowledge[0].model)
-        vectordb = knowledge_imp.decide_vectorstores(knowledge[0].collection_name, 'Milvus',
-                                                     embedding)
-        vectordb.partition_key = knowledge[0].id
-        content = vectordb.as_retriever(search_kwargs=search_kwargs)._get_relevant_documents(
-            question, run_manager=None)
-        if content:
-            content = [
-                knowledge_imp.KnowledgeUtils.chunk2promt(c.page_content, c.metadata)
-                for c in content
-            ]
-        else:
-            content = []
-        return content
+        try:
+            _ = decide_embeddings(knowledge[0].model)
+        except Exception as e:
+            raise MessageException(message="请联系管理员检查工作台向量检索模型状态")
+
+        vector_store = create_knowledge_vector_store([str(knowledge[0].id)], login_user.user_name)
+        keyword_store = create_knowledge_keyword_store([str(knowledge[0].id)], login_user.user_name)
+
+        # 获取配置中的最大token数，如果没有配置则使用默认值
+        config = cls.get_config()
+        max_tokens = config.maxTokens if config else 1500
+
+        # 获取知识库溯源模型 ID，如果没有配置则使用知识库的嵌入模型 ID
+        from bisheng.api.services.llm import LLMService
+        knowledge_llm = LLMService.get_knowledge_llm()
+        model_id = knowledge_llm.source_model_id
+
+        docs = mixed_retrieval_recall(question, vector_store, keyword_store, max_tokens, model_id)
+        logger.info(f"docs message: {docs}")
+        # 将检索结果格式化为指定的模板格式
+        formatted_results = []
+        if docs:
+            for doc in docs:
+                # 获取文件名，优先从 metadata 中获取
+                file_name = doc.metadata.get('file_name', 'unknown_file')
+                if not file_name or file_name == 'unknown_file':
+                    # 尝试从其他字段获取文件名
+                    file_name = doc.metadata.get('source', doc.metadata.get('filename', 'unknown_file'))
+
+                # 获取文档内容
+                content = doc.page_content.strip()
+
+                # 按照模板格式组织内容
+                formatted_content = f"[file name]:{file_name}\n[file content begin]\n{content}\n[file content end]\n"
+                formatted_results.append(formatted_content)
+
+        return formatted_results
 
     @classmethod
     def get_chat_history(cls, chat_id: str, size: int = 4):
