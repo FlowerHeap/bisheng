@@ -1,20 +1,15 @@
-import hashlib
 import json
 from typing import Dict, List, Optional
 
-import yaml
-from bisheng_langchain.gpts.tools.api_tools.openapi import OpenApiTools
 from fastapi import (APIRouter, Body, Depends, HTTPException, Query, Request, WebSocket,
                      WebSocketException)
 from fastapi import status as http_status
 from fastapi.responses import StreamingResponse
-from fastapi_jwt_auth import AuthJWT
 
 from bisheng.api.services.assistant import AssistantService
 from bisheng.api.services.openapi import OpenApiSchema
 from bisheng.api.services.tool import ToolServices
 from bisheng.api.services.user_service import UserPayload, get_admin_user, get_login_user
-from bisheng.api.utils import get_url_content, md5_hash
 from bisheng.api.v1.schemas import (AssistantCreateReq, AssistantUpdateReq,
                                     DeleteToolTypeReq, StreamData, TestToolReq,
                                     resp_200, resp_500)
@@ -23,11 +18,13 @@ from bisheng.chat.manager import ChatManager
 from bisheng.chat.types import WorkType
 from bisheng.database.constants import ToolPresetType
 from bisheng.database.models.assistant import Assistant
-from bisheng.database.models.gpts_tools import GptsTools, GptsToolsTypeRead
-from bisheng.mcp_manage.constant import McpClientType
+from bisheng.database.models.gpts_tools import GptsToolsTypeRead
+from bisheng.mcp_manage.langchain.tool import McpTool
 from bisheng.mcp_manage.manager import ClientManager
 from bisheng.utils import generate_uuid
 from bisheng.utils.logger import logger
+from bisheng_langchain.gpts.tools.api_tools.openapi import OpenApiTools
+from fastapi_jwt_auth import AuthJWT
 
 router = APIRouter(prefix='/assistant', tags=['Assistant'])
 chat_manager = ChatManager()
@@ -240,7 +237,9 @@ async def mcp_tool_run(login_user: UserPayload = Depends(get_login_user),
         client = await ClientManager.connect_mcp_from_json(req.openapi_schema)
         extra = json.loads(req.extra)
         tool_name = extra.get('name')
-        resp = await client.call_tool(tool_name, req.request_params)
+        mcp_tool = McpTool.get_mcp_tool(name=tool_name, description=extra.get("description"), mcp_client=client,
+                                        mcp_tool_name=tool_name, arg_schema=extra.get('inputSchema', {}))
+        resp = await mcp_tool.arun(req.request_params)
         return resp_200(data=resp)
     except Exception as e:
         logger.exception('mcp_tool_run error')
@@ -259,8 +258,8 @@ async def refresh_all_mcp_tools(request: Request, login_user: UserPayload = Depe
 
 @router.post('/tool_list')
 async def add_tool_type(*,
-                  req: Dict = Body(default={}, description='openapi解析后的工具对象'),
-                  login_user: UserPayload = Depends(get_login_user)):
+                        req: Dict = Body(default={}, description='openapi解析后的工具对象'),
+                        login_user: UserPayload = Depends(get_login_user)):
     """ 新增自定义tool """
     req = GptsToolsTypeRead(**req)
     return await AssistantService.add_gpts_tools(login_user, req)
@@ -268,11 +267,11 @@ async def add_tool_type(*,
 
 @router.put('/tool_list')
 async def update_tool_type(*,
-                     login_user: UserPayload = Depends(get_login_user),
-                     req: Dict = Body(default={}, description='通过openapi 解析后的内容，包含类别的唯一ID')):
+                           login_user: UserPayload = Depends(get_login_user),
+                           req: Dict = Body(default={}, description='通过openapi 解析后的内容，包含类别的唯一ID')):
     """ 更新自定义tool """
     req = GptsToolsTypeRead(**req)
-    return await AssistantService.update_gpts_tools(login_user, req)
+    return resp_200(data=await ToolServices.update_gpts_tools(login_user, req))
 
 
 @router.delete('/tool_list')

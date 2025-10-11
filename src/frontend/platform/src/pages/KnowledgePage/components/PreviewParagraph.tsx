@@ -2,26 +2,18 @@ import { LoadingIcon } from "@/components/bs-icons/loading";
 import { Button } from "@/components/bs-ui/button";
 import { useToast } from "@/components/bs-ui/toast/use-toast";
 import Tip from "@/components/bs-ui/tooltip/tip";
-import { CodeBlock } from "@/modals/formModal/chatMessage/codeBlock";
+import { locationContext } from "@/contexts/locationContext";
+import MessageMarkDown from "@/pages/BuildPage/flow/FlowChat/MessageMarkDown";
 import { cn } from "@/util/utils";
 import { debounce } from "lodash-es";
 import { CircleX, FileCode, LocateFixed } from "lucide-react";
-import { forwardRef, useCallback, useContext, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useContext, useEffect, useImperativeHandle, useRef, useState } from "react";
 import AceEditor from "react-ace";
-import ReactMarkdown from "react-markdown";
-import rehypeMathjax from "rehype-mathjax";
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
 import Vditor from 'vditor';
 import 'vditor/dist/index.css';
 import useKnowledgeStore from "../useKnowledgeStore";
-import { locationContext } from "@/contexts/locationContext";
 
 export const MarkdownView = ({ noHead = false, data }) => {
-    const text = useMemo(() =>
-        data.text.replaceAll(/(\n\s{4,})/g, '\n   ') // 禁止4空格转代码
-            .replace(/(?<![\n\|])\n(?!\n)/g, '\n\n')
-        , [data.text])
 
     return <div className="p-4 bg-white rounded-lg shadow-sm border border-gray-200 hover:shadow-md hover:border-primary transition-shadow w-full">
         {!noHead && <p className="text-sm text-gray-500 flex gap-2 mb-1">
@@ -29,39 +21,7 @@ export const MarkdownView = ({ noHead = false, data }) => {
             <span>-</span>
             <span>{data.text.length} 字符</span>
         </p>}
-        <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkMath]}
-            rehypePlugins={[rehypeMathjax]}
-            linkTarget="_blank"
-            className="react-markdown inline-block break-all max-w-full text-sm text-gray-500"
-            components={{
-                code: ({ node, inline, className, children, ...props }) => {
-                    if (children.length) {
-                        if (children[0] === "▍") {
-                            return (<span className="form-modal-markdown-span"> ▍ </span>);
-                        }
-                        if (typeof children[0] === "string") {
-                            children[0] = children[0].replace("▍", "▍");
-                        }
-                    }
-                    // className 区分代码语言 python json js 
-                    const match = /language-(\w+)/.exec(className || "");
-
-                    return !inline ? (
-                        <CodeBlock
-                            key={Math.random()}
-                            language={(match && match[1]) || ""}
-                            value={String(children).replace(/\n$/, "")}
-                            {...props}
-                        />
-                    ) : (
-                        <code className={className} {...props}> {children} </code>
-                    );
-                },
-            }}
-        >
-            {text}
-        </ReactMarkdown>
+        <MessageMarkDown message={data.text} />
     </div>
 }
 
@@ -123,11 +83,11 @@ const VditorEditor = forwardRef(({ defalutValue, hidden, onBlur, onChange }, ref
 
     useEffect(() => {
         vditorRef.current = new Vditor(domRef.current, {
-            cdn: location.origin + '/vditor',
+            cdn: location.origin + __APP_ENV__.BASE_URL + '/vditor',
             height: '100%',
             toolbarConfig: {
                 hide: true,
-                pin: true, 
+                pin: true,
             },
             mode: 'ir',  // 'sv' for split view, 'ir' for instant rendering
             preview: {
@@ -169,8 +129,18 @@ const VditorEditor = forwardRef(({ defalutValue, hidden, onBlur, onChange }, ref
             },
         });
 
-        return () => {
-            vditorRef.current?.destroy();
+         return () => {
+            // 1. 校验实例存在 + 初始化完成 + DOM节点存在
+            if (vditorRef.current && readyRef.current && domRef.current) {
+                try {
+                    vditorRef.current.destroy(); // 仅在安全状态下执行销毁
+                } catch (error) {
+                    console.warn('Vditor销毁时发生异常:', error); // 捕获异常避免阻断流程
+                }
+            }
+            // 2. 清空引用，释放内存
+            vditorRef.current = null;
+            readyRef.current = false;
         };
     }, []);
 
@@ -178,6 +148,8 @@ const VditorEditor = forwardRef(({ defalutValue, hidden, onBlur, onChange }, ref
 });
 
 const EditMarkdown = ({ data, active, fileSuffix, onClick, onDel, onChange, onPositionClick }) => {
+    console.log(data, active, fileSuffix ,5555555555555555);
+    
     const [edit, setEdit] = useState(false); // 编辑原始格式
     const { appConfig } = useContext(locationContext)
 
@@ -266,7 +238,7 @@ const EditMarkdown = ({ data, active, fileSuffix, onClick, onDel, onChange, onPo
 }
 
 // 分段结果列表
-export default function PreviewParagraph({ fileId, previewCount, edit, fileSuffix, loading, chunks, onDel, onChange }) {
+export default function PreviewParagraph({ fileId, previewCount, edit, fileSuffix, loading, chunks, className, onDel, onChange }) {
     const containerRef = useRef(null);
     const [visibleItems, setVisibleItems] = useState(10); // 初始加载数量
     const loadingRef = useRef(false);
@@ -277,6 +249,17 @@ export default function PreviewParagraph({ fileId, previewCount, edit, fileSuffi
         document.addEventListener('click', fun)
         return () => document.removeEventListener('click', fun)
     }, [])
+
+    useEffect(() => {
+        // 1. 重置懒加载计数（避免显示旧文件的前 N 项）
+        setVisibleItems(10);
+        // 2. 重置选中的分段（避免跨文件选中旧分段）
+        setSelectedChunkIndex(-1);
+        // 3. 重置滚动位置（避免新文件显示旧文件的滚动位置）
+        if (containerRef.current) {
+            containerRef.current.scrollTop = 0;
+        }
+    }, [fileId, setSelectedChunkIndex]);
 
     // 懒加载逻辑
     useEffect(() => {
@@ -298,13 +281,13 @@ export default function PreviewParagraph({ fileId, previewCount, edit, fileSuffi
         return () => container.removeEventListener('scroll', handleScroll);
     }, [chunks.length]);
 
-    return <div className="w-full pt-3 pb-10 relative ">
+    return <div className="pt-3 relative w-full">
         {loading && (
             <div className="absolute left-0 top-0 z-10 flex h-full w-full items-center justify-center bg-[rgba(255,255,255,0.6)] dark:bg-blur-shared">
                 <LoadingIcon />
             </div>
         )}
-        <div ref={containerRef} className="h-[calc(100vh-284px)] overflow-y-auto"
+        <div ref={containerRef} className={`${className} overflow-y-auto`}
             style={{ scrollbarWidth: 'thin' }}
         >
             <div className="space-y-6">

@@ -1,22 +1,25 @@
 import { createBrowserRouter, Navigate, Outlet } from 'react-router-dom';
 import {
+  ApiErrorWatcher,
   Login,
   Registration,
   RequestPasswordReset,
   ResetPassword,
-  VerifyEmail,
-  ApiErrorWatcher,
   TwoFactorScreen,
+  VerifyEmail,
 } from '~/components/Auth';
+import Sop from '~/components/Sop';
+import WebView from '~/components/WebView';
 import { AuthContextProvider } from '~/hooks/AuthContext';
-import RouteErrorBoundary from './RouteErrorBoundary';
-import StartupLayout from './Layouts/Startup';
-import LoginLayout from './Layouts/Login';
-import dashboardRoutes from './Dashboard';
-import ShareRoute from './ShareRoute';
+import AgentCenter from '~/pages/apps';
+import AppChat from '~/pages/appChat';
+import Zombie from '~/pages/zombie';
 import ChatRoute from './ChatRoute';
-import Search from './Search';
+import LoginLayout from './Layouts/Login';
+import StartupLayout from './Layouts/Startup';
 import Root from './Root';
+import RouteErrorBoundary from './RouteErrorBoundary';
+import ShareRoute from './ShareRoute';
 
 const AuthLayout = () => (
   <AuthContextProvider>
@@ -65,7 +68,7 @@ export const router = createBrowserRouter([
     errorElement: <RouteErrorBoundary />,
     children: [
       {
-        path: '/',
+        path: '/' + __APP_ENV__.BISHENG_HOST,
         element: <LoginLayout />,
         children: [
           {
@@ -82,7 +85,7 @@ export const router = createBrowserRouter([
       // dashboardRoutes,
       {
         path: '/',
-        element: <Root />,
+        element: <Root />, // 包含会话列表
         children: [
           {
             index: true,
@@ -92,12 +95,28 @@ export const router = createBrowserRouter([
             path: 'c/:conversationId?',
             element: <ChatRoute />,
           },
-          // {
-          //   path: 'search',
-          //   element: <Search />,
-          // },
+          {
+            path: 'linsight/:conversationId?',
+            element: <Sop />,
+          },
+          {
+            path: 'apps',
+            element: <AgentCenter />,
+          },
+          {
+            path: 'chat/:conversationId/:fid/:type',
+            element: <AppChat />,
+          },
+          {
+            path: 'zombie',
+            element: <Zombie />,
+          },
         ],
       },
     ],
+  },
+  {
+    path: '/html',
+    element: <WebView />,
   },
 ], baseConfig);

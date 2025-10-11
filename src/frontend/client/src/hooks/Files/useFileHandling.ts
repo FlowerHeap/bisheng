@@ -26,6 +26,7 @@ type UseFileHandling = {
   fileSetter?: FileSetter;
   fileFilter?: (file: File) => boolean;
   additionalMetadata?: Record<string, string | undefined>;
+  isLinsight?: boolean;
 };
 
 const useFileHandling = (params?: UseFileHandling) => {
@@ -129,16 +130,20 @@ const useFileHandling = (params?: UseFileHandling) => {
         const error = _error as TError | undefined;
         console.log('upload error', error);
         const file_id = body.get('file_id');
+        const file_name = body.get('file_name');
         clearUploadTimer(file_id as string);
         deleteFileById(file_id as string);
-        const errorMessage =
-          error?.code === 'ERR_CANCELED'
-            ? 'com_error_files_upload_canceled'
-            : (error?.response?.data?.message ?? 'com_error_files_upload');
-        setError(errorMessage);
+        if (error?.code !== 'ERR_CANCELED') {
+          setError(file_name + ' 解析失败');
+        }
+        // const errorMessage =
+        //   error?.code === 'ERR_CANCELED'
+        //     ? 'com_error_files_upload_canceled'
+        //     : file_name + ' 解析失败';
+        // // : (error?.response?.data?.message ?? 'com_error_files_upload');
+        // setError(errorMessage);
       },
-    },
-    abortControllerRef.current?.signal,
+    }
   );
 
   const startUpload = async (extendedFile: ExtendedFile) => {
@@ -149,6 +154,7 @@ const useFileHandling = (params?: UseFileHandling) => {
     formData.append('endpoint', endpoint);
     formData.append('file', extendedFile.file as File, encodeURIComponent(filename));
     formData.append('file_id', extendedFile.file_id);
+    formData.append('file_name', extendedFile.file?.name ?? '');
 
     const width = extendedFile.width ?? 0;
     const height = extendedFile.height ?? 0;
@@ -182,7 +188,7 @@ const useFileHandling = (params?: UseFileHandling) => {
     }
 
     if (!isAssistantsEndpoint(endpoint)) {
-      uploadFile.mutate(formData);
+      uploadFile.mutate({ body: formData, signal: extendedFile.abortController.signal });
       return;
     }
 
@@ -233,10 +239,11 @@ const useFileHandling = (params?: UseFileHandling) => {
   };
 
   const handleFiles = async (_files: FileList | File[], _toolResource?: string) => {
-    abortControllerRef.current = new AbortController();
+    // abortControllerRef.current = new AbortController();
     const fileList = Array.from(_files);
     /* Validate files */
     let filesAreValid: boolean;
+
     try {
       filesAreValid = validateFiles({
         files,
@@ -247,6 +254,7 @@ const useFileHandling = (params?: UseFileHandling) => {
           fileConfig?.endpoints.default ??
           defaultFileConfig.endpoints[endpoint] ??
           defaultFileConfig.endpoints.default,
+        noLimitSize: true
       });
     } catch (error) {
       console.error('file validation error', error);
@@ -270,6 +278,7 @@ const useFileHandling = (params?: UseFileHandling) => {
           preview,
           progress: 0.2,
           size: originalFile.size,
+          abortController: new AbortController()
         };
 
         if (_toolResource != null && _toolResource !== '') {
@@ -311,8 +320,12 @@ const useFileHandling = (params?: UseFileHandling) => {
     }
   };
 
-  const abortUpload = () => {
-    if (abortControllerRef.current) {
+  const abortUpload = (file) => {
+    if (file.abortController) {
+      logger.log('files', 'Aborting upload');
+      file.abortController.abort('User aborted upload');
+      file.abortController = null;
+    } else if (abortControllerRef.current) {
       logger.log('files', 'Aborting upload');
       abortControllerRef.current.abort('User aborted upload');
       abortControllerRef.current = null;

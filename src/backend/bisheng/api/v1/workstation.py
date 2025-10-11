@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import datetime
+from typing import Optional
 from urllib.parse import unquote
 from uuid import uuid4
 
@@ -11,19 +12,26 @@ from langchain_core.runnables import RunnableConfig
 from loguru import logger
 
 from bisheng.api.services import knowledge_imp
+from bisheng.api.services.assistant_agent import AssistantAgent
 from bisheng.api.services.knowledge import KnowledgeService
 from bisheng.api.services.user_service import UserPayload, get_admin_user, get_login_user
+from bisheng.api.services.workflow import WorkFlowService
 from bisheng.api.services.workstation import (SSECallbackClient, WorkstationConversation,
-                                              WorkstationMessage, WorkStationService, SearchTool)
+                                              WorkstationMessage, WorkStationService)
 from bisheng.api.v1.callback import AsyncStreamingLLMCallbackHandler
 from bisheng.api.v1.schema.chat_schema import APIChatCompletion, SSEResponse, delta
-from bisheng.api.v1.schemas import WorkstationConfig, resp_200, resp_500, WSPrompt, ExcelRule
+from bisheng.api.v1.schemas import FrequentlyUsedChat
+from bisheng.api.v1.schemas import WorkstationConfig, resp_200, resp_500, WSPrompt, ExcelRule, UnifiedResponseModel
 from bisheng.cache.redis import redis_client
 from bisheng.cache.utils import file_download, save_download_file, save_uploaded_file
+from bisheng.core.app_context import app_ctx
 from bisheng.database.models.flow import FlowType
+from bisheng.database.models.gpts_tools import GptsToolsDao
 from bisheng.database.models.message import ChatMessage, ChatMessageDao
 from bisheng.database.models.session import MessageSession, MessageSessionDao
 from bisheng.interface.llms.custom import BishengLLM
+from bisheng.settings import settings as bisheng_settings
+from bisheng.utils.exceptions import MessageException
 
 router = APIRouter(prefix='/workstation', tags=['WorkStation'])
 
@@ -102,17 +110,30 @@ def final_message(conversation: MessageSession, title: str, requestMessage: Chat
     return f'event: message\ndata: {msg}\n\n'
 
 
-@router.get('/config')
+@router.get('/config', summary='获取工作台配置', response_model=UnifiedResponseModel)
 def get_config(
         request: Request,
-        login_user: UserPayload = Depends(get_login_user),
-):
+        login_user: UserPayload = Depends(get_login_user)):
     """ 获取评价相关的模型配置 """
     ret = WorkStationService.get_config()
+
+    etl4lm_settings = bisheng_settings.get_knowledge().get("etl4lm", {})
+    etl_for_lm_url = etl4lm_settings.get("url", None)
+    if ret:
+        ret = ret.model_dump()
+    else:
+        ret = {}
+    ret['enable_etl4lm'] = bool(etl_for_lm_url)
+
+    linsight_invitation_code = bisheng_settings.get_all_config().get('linsight_invitation_code', None)
+    ret['linsight_invitation_code'] = linsight_invitation_code if linsight_invitation_code else False
+    ret['linsight_cache_dir'] = "./"
+    ret['waiting_list_url'] = bisheng_settings.get_linsight_conf().waiting_list_url
+
     return resp_200(data=ret)
 
 
-@router.post('/config')
+@router.post('/config', summary='更新工作台配置', response_model=UnifiedResponseModel)
 def update_config(
         request: Request,
         login_user: UserPayload = Depends(get_admin_user),
@@ -238,13 +259,13 @@ async def webSearch(query: str, web_search_config: WSPrompt):
     """
     联网搜索
     """
-    if web_search_config.params:
-        tool = SearchTool.init_search_tool(web_search_config.tool, **web_search_config.params)
-    else:
-        # 兼容旧版的配置
-        tool = SearchTool.init_search_tool('bing', api_key=web_search_config.bingKey,
-                                           base_url=web_search_config.bingUrl)
-    return tool.invoke(query)
+    web_search_info = GptsToolsDao.get_tool_by_tool_key("web_search")
+    if not web_search_info:
+        raise Exception("No web_search tool found in database")
+    web_search_tool = await AssistantAgent.init_tools_by_tool_ids([web_search_info.id], None)
+    if not web_search_tool:
+        raise Exception("No web_search tool found in gpts tools")
+    return web_search_tool[0].invoke(input={"query": query})
 
 
 def getFileContent(filepath):
@@ -357,8 +378,17 @@ async def chat_completions(
             elif data.knowledge_enabled:
                 logger.info(f'knowledge, prompt={data.text}')
                 chunks = WorkStationService.queryChunksFromDB(data.text, login_user)
-                prompt = wsConfig.knowledgeBase.prompt.format(
-                    retrieved_file_content='\n'.join(chunks)[:max_token], question=data.text)
+
+                if wsConfig.knowledgeBase.prompt:
+                    prompt = wsConfig.knowledgeBase.prompt.format(
+                        retrieved_file_content='\n'.join(chunks)[:max_token], question=data.text)
+                else:
+                    prompt_service = app_ctx.get_prompt_loader()
+                    prompt = prompt_service.render_prompt('qa', 'simple_qa', context='\n'.join(chunks)[:max_token],
+                                                          question=data.text).prompt
+
+                logger.debug(f'Knowledge prompt: {prompt}')
+
             elif data.files:
                 #  获取文件全文
                 filecontent = '\n'.join(
@@ -371,16 +401,20 @@ async def chat_completions(
                 extra['prompt'] = prompt
                 message.extra = json.dumps(extra, ensure_ascii=False)
                 ChatMessageDao.insert_one(message)
-        except Exception as e:
-            logger.error(f'Error in processing the prompt: {e}')
+        except MessageException as e:
             error = True
-            final_res = 'Error in processing the prompt'
+            final_res = str(e)
+        except Exception as e:
+            logger.exception(f'Error in processing the prompt')
+            error = True
+            final_res = f'Error in processing the prompt: {str(e)[-100:]}'
 
         if not error:
             messages = WorkStationService.get_chat_history(conversationId, 8)[:-1]
             inputs = [*messages, HumanMessage(content=prompt)]
             if wsConfig.systemPrompt:
-                inputs.insert(0, SystemMessage(content=wsConfig.systemPrompt))
+                system_content = wsConfig.systemPrompt.format(cur_date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                inputs.insert(0, SystemMessage(content=system_content))
             task = asyncio.create_task(
                 bishengllm.ainvoke(
                     inputs,
@@ -451,3 +485,42 @@ async def chat_completions(
             asyncio.create_task(genTitle(data.text, final_res, bishengllm, conversationId))
 
     return StreamingResponse(event_stream(), media_type='text/event-stream')
+
+
+@router.get('/app/frequently_used')
+def frequently_used_chat(login_user: UserPayload = Depends(get_login_user),
+                         user_link_type: Optional[str] = 'app',
+                         page: Optional[int] = 1,
+                         limit: Optional[int] = 8
+                         ):
+    data, _ = WorkFlowService.get_frequently_used_flows(login_user, user_link_type, page, limit)
+
+    return resp_200(data=data)
+
+
+@router.post('/app/frequently_used')
+def frequently_used_chat(login_user: UserPayload = Depends(get_login_user),
+                         data: FrequentlyUsedChat = Body(..., description='添加常用应用')
+                         ):
+    is_new = WorkFlowService.add_frequently_used_flows(login_user, data.user_link_type, data.type_detail)
+    if is_new:
+        return resp_200(message='添加成功')
+    else:
+        return resp_500(message='该智能体已被添加')
+
+
+@router.delete('/app/frequently_used')
+def frequently_used_chat(login_user: UserPayload = Depends(get_login_user),
+                         user_link_type: Optional[str] = None,
+                         type_detail: Optional[str] = None
+                         ):
+    WorkFlowService.delete_frequently_used_flows(login_user, user_link_type, type_detail)
+    return resp_200(message='删除成功')
+
+
+@router.get('/app/uncategorized')
+def get_uncategorized_chat(login_user: UserPayload = Depends(get_login_user),
+                           page: Optional[int] = 1,
+                           limit: Optional[int] = 8):
+    data, _ = WorkFlowService.get_uncategorized_flows(login_user, page, limit)
+    return resp_200(data=data)

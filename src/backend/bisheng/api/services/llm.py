@@ -1,7 +1,7 @@
 import json
 from typing import List, Optional
 
-from fastapi import Request
+from fastapi import Request, BackgroundTasks
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from loguru import logger
@@ -10,11 +10,14 @@ from bisheng.api.errcode.base import NotFoundError
 from bisheng.api.errcode.llm import ServerExistError, ModelNameRepeatError, ServerAddError, ServerAddAllError
 from bisheng.api.services.user_service import UserPayload
 from bisheng.api.v1.schemas import LLMServerInfo, LLMModelInfo, KnowledgeLLMConfig, AssistantLLMConfig, \
-    EvaluationLLMConfig, AssistantLLMItem, LLMServerCreateReq
+    EvaluationLLMConfig, AssistantLLMItem, LLMServerCreateReq, WorkbenchModelConfig
 from bisheng.database.models.config import ConfigDao, ConfigKeyEnum, Config
 from bisheng.database.models.llm_server import LLMDao, LLMServer, LLMModel, LLMModelType
 from bisheng.interface.importing import import_by_type
 from bisheng.interface.initialize.loading import instantiate_llm, instantiate_embedding
+from bisheng.utils.embedding import decide_embeddings
+from bisheng.database.models.knowledge import KnowledgeDao, KnowledgeTypeEnum
+from bisheng.database.models.knowledge import KnowledgeState
 
 
 class LLMService:
@@ -406,3 +409,70 @@ class LLMService:
             ret.append(LLMServerInfo(**one.dict(exclude={'config'}), models=model_dict[one.id]))
 
         return ret
+
+    @classmethod
+    async def update_workbench_llm(cls, config_obj: WorkbenchModelConfig, background_tasks: BackgroundTasks):
+        """
+        更新灵思模型配置
+        :param config_obj:
+        :return:
+        """
+        # 延迟导入以避免循环导入
+        from bisheng.worker.knowledge.rebuild_knowledge_worker import rebuild_knowledge_celery
+
+        config = await ConfigDao.aget_config(ConfigKeyEnum.LINSIGHT_LLM)
+        if not config:
+            config = Config(key=ConfigKeyEnum.LINSIGHT_LLM.value, value='{}')
+
+        if config_obj.embedding_model:
+            # 判断是否一致
+            config_old_obj = WorkbenchModelConfig(**json.loads(config.value)) if config else WorkbenchModelConfig()
+            if (config_obj.embedding_model.id and config_old_obj.embedding_model is None or
+                    config_obj.embedding_model.id != config_old_obj.embedding_model.id):
+                embeddings = decide_embeddings(config_obj.embedding_model.id)
+                try:
+                    await embeddings.aembed_query("test")
+                except Exception as e:
+                    raise Exception(f"Embedding模型初始化失败: {str(e)}")
+                from bisheng.api.services.linsight.sop_manage import SOPManageService
+
+                background_tasks.add_task(SOPManageService.rebuild_sop_vector_store_task, embeddings)
+
+                # 更新个人知识库
+                # 1.更新所有type为2(私有知识库)的knowledge状态和模型
+                private_knowledges = KnowledgeDao.get_all_knowledge(
+                    knowledge_type=KnowledgeTypeEnum.PRIVATE
+                )
+
+                updated_count = 0
+                for knowledge in private_knowledges:
+                    # 更新状态为重建中，模型为新的model_id
+                    knowledge.state = KnowledgeState.REBUILDING.value
+                    knowledge.model = str(embeddings.model_id)
+                    KnowledgeDao.update_one(knowledge)
+                    updated_count += 1
+                    
+                    # 3. 为每个knowledge发起异步任务
+                    rebuild_knowledge_celery.delay(knowledge.id, str(embeddings.model_id))
+                    logger.info(f"Started rebuild task for knowledge_id={knowledge.id} with model_id={embeddings.model_id}")
+            
+                logger.info(f"Updated {updated_count} private knowledge bases to use new embedding model {embeddings.model_id}")                
+
+
+        config.value = json.dumps(config_obj.model_dump(), ensure_ascii=False)
+
+        await ConfigDao.async_insert_config(config)
+
+        return config_obj
+
+    @classmethod
+    async def get_workbench_llm(cls) -> WorkbenchModelConfig:
+        """
+        获取工作台模型配置
+        :return:
+        """
+        ret = {}
+        config = await ConfigDao.aget_config(ConfigKeyEnum.LINSIGHT_LLM)
+        if config:
+            ret = json.loads(config.value)
+        return WorkbenchModelConfig(**ret)
